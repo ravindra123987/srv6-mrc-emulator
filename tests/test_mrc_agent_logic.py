@@ -424,5 +424,121 @@ class TestApplyLossReport(unittest.TestCase):
         self.assertEqual(stats.planes_skipped_no_data, 1)
 
 
+class TestApplyLossReportAbsentEvs(unittest.TestCase):
+    """The receiver omits EVs with seen == 0 from its report, so a fully
+    blackholed EV never appears in one. When the sender's paired window
+    shows it sprayed that EV, absence from an otherwise non-empty report
+    is 100% loss, not "no data"."""
+
+    NUM = 4
+
+    def _table(self, **cfg):
+        base = dict(loss_threshold=0.25, loss_demote_consecutive=3,
+                    min_active_evs=1)
+        base.update(cfg)
+        return EVStateTable(
+            tenants=("green",), num_planes=self.NUM, num_paths=self.NUM,
+            cfg=EVStateConfig(**base),
+        )
+
+    def _ring(self, sent):
+        ring = SentWindowRing(num_planes=self.NUM, num_paths=self.NUM)
+        grid = [[0] * self.NUM for _ in range(self.NUM)]
+        for (p, q), n in sent.items():
+            grid[p][q] = n
+        ring.push(SentWindow(start_ns=0, end_ns=100_000_000,
+                             sent=tuple(map(tuple, grid))))
+        return ring
+
+    # Receiver saw EV (0,0) only; (1,0) is missing from the report.
+    REPORT = LossReport(window_id=0, planes=(
+        PlaneLossRecord(plane_id=0, path_id=0, seen=10, expected=10,
+                        max_gap=0),
+    ))
+
+    def _apply(self, t, ring, *, times=1, report=None, received_at_ns=50_000_000):
+        stats = LossFusionStats()
+        for _ in range(times):
+            apply_loss_report(
+                table=t, tenant="green", report=report or self.REPORT,
+                sent_ring=ring, received_at_ns=received_at_ns,
+                max_window_skew_ns=10**9, stats=stats,
+            )
+        return stats
+
+    def test_blackholed_ev_is_demoted(self):
+        t = self._table()
+        ring = self._ring({(0, 0): 10, (1, 0): 10})
+        stats = self._apply(t, ring, times=3)
+        self.assertIs(t.state("green", 1, 0), EVState.ASSUMED_BAD)
+        self.assertIsNot(t.state("green", 0, 0), EVState.ASSUMED_BAD)
+        self.assertEqual(stats.absent_evs_counted_as_lost, 3)
+        self.assertEqual(t.inspect("green", 1, 0)["last_loss_ratio"], 1.0)
+
+    def test_absent_ev_below_min_sent_is_ignored(self):
+        # 1-2 packets can straddle the receiver's window edge; absence
+        # there is not evidence of loss.
+        t = self._table()
+        ring = self._ring({(0, 0): 10, (1, 0): 2})
+        stats = self._apply(t, ring, times=5)
+        self.assertIsNot(t.state("green", 1, 0), EVState.ASSUMED_BAD)
+        self.assertEqual(stats.absent_evs_counted_as_lost, 0)
+
+    def test_unsprayed_ev_is_ignored(self):
+        t = self._table()
+        ring = self._ring({(0, 0): 10})
+        stats = self._apply(t, ring, times=5)
+        self.assertEqual(stats.absent_evs_counted_as_lost, 0)
+        for p in range(self.NUM):
+            for q in range(self.NUM):
+                self.assertIsNot(t.state("green", p, q), EVState.ASSUMED_BAD)
+
+    def test_already_demoted_ev_is_not_rearmed(self):
+        # Right after a demote the paired window still shows sends on
+        # the EV. Counting it as lost again would re-arm the loss gate
+        # and block probe recovery (the weight-0 EV never gets a clean
+        # loss window).
+        t = self._table()
+        ring = self._ring({(0, 0): 10, (1, 0): 10})
+        self._apply(t, ring, times=3)
+        self.assertIs(t.state("green", 1, 0), EVState.ASSUMED_BAD)
+        stats = self._apply(t, ring, times=3)
+        self.assertEqual(stats.absent_evs_counted_as_lost, 0)
+        self.assertEqual(
+            t.inspect("green", 1, 0)["consecutive_loss_demote_windows"], 0)
+
+    def test_unpaired_report_counts_nothing_absent(self):
+        t = self._table()
+        ring = self._ring({(0, 0): 10, (1, 0): 10})
+        stats = self._apply(t, ring, times=3, received_at_ns=10**13)
+        self.assertEqual(stats.absent_evs_counted_as_lost, 0)
+        self.assertIsNot(t.state("green", 1, 0), EVState.ASSUMED_BAD)
+
+    def test_partial_window_report_counts_nothing_absent(self):
+        # Receiver's window caught only a slice of the sender's (phase
+        # skew / burst straddling the edge): healthy EVs are missing
+        # too, so absence is not evidence.
+        t = self._table()
+        ring = self._ring({(p, 0): 10 for p in range(self.NUM)})
+        report = LossReport(window_id=0, planes=(
+            PlaneLossRecord(plane_id=0, path_id=0, seen=8, expected=8,
+                            max_gap=0),
+        ))
+        stats = self._apply(t, ring, times=3, report=report)
+        self.assertEqual(stats.absent_evs_counted_as_lost, 0)
+        self.assertEqual(stats.absent_check_skipped_low_coverage, 3)
+        for p in range(1, self.NUM):
+            self.assertIsNot(t.state("green", p, 0), EVState.ASSUMED_BAD)
+
+    def test_empty_report_counts_nothing_absent(self):
+        # Zero records = receiver saw nothing at all (flow idle/ended);
+        # that's already handled as "no signal", not a fabric-wide loss.
+        t = self._table()
+        ring = self._ring({(0, 0): 10, (1, 0): 10})
+        stats = self._apply(
+            t, ring, times=3, report=LossReport(window_id=0, planes=()))
+        self.assertEqual(stats.absent_evs_counted_as_lost, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
