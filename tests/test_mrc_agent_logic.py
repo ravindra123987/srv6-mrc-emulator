@@ -476,10 +476,10 @@ class TestApplyLossReportAbsentEvs(unittest.TestCase):
         self.assertEqual(t.inspect("green", 1, 0)["last_loss_ratio"], 1.0)
 
     def test_absent_ev_below_min_sent_is_ignored(self):
-        # 1-2 packets can straddle the receiver's window edge; absence
+        # A lone packet can straddle the receiver's window edge; absence
         # there is not evidence of loss.
         t = self._table()
-        ring = self._ring({(0, 0): 10, (1, 0): 2})
+        ring = self._ring({(0, 0): 10, (1, 0): 1})
         stats = self._apply(t, ring, times=5)
         self.assertIsNot(t.state("green", 1, 0), EVState.ASSUMED_BAD)
         self.assertEqual(stats.absent_evs_counted_as_lost, 0)
@@ -538,6 +538,77 @@ class TestApplyLossReportAbsentEvs(unittest.TestCase):
         stats = self._apply(
             t, ring, times=3, report=LossReport(window_id=0, planes=()))
         self.assertEqual(stats.absent_evs_counted_as_lost, 0)
+
+
+class TestLossPathTimeline(unittest.TestCase):
+    """Event-timeline simulation of the loss path at lab defaults
+    (300 ms windows on both sides, 500 ms pairing skew) with the
+    receiver's window phase-shifted from the sender's and per-packet
+    jitter. Pins the rate/threshold trade-off: no healthy EV is ever
+    demoted, and a blackholed EV is demoted even at the committed
+    scenarios' 100 pps."""
+
+    W = 0.3
+    SKEW_NS = 500_000_000
+
+    def _run(self, *, rate_pps, seed, drop=None, dur_s=30.0):
+        import random
+        rnd = random.Random(seed)
+        phase = rnd.uniform(0, self.W)
+        n_p = n_q = 4
+        t = EVStateTable(tenants=("g",), num_planes=n_p, num_paths=n_q)
+        ring = SentWindowRing(num_planes=n_p, num_paths=n_q)
+        rx = LossWindowTable(num_planes=n_p, num_paths=n_q)
+        evs = [(p, q) for q in range(n_q) for p in range(n_p)]
+        events = []
+        for i in range(int(rate_pps * dur_s)):
+            ts = i / rate_pps + rnd.uniform(0, 0.05)
+            ev = evs[i % len(evs)]
+            events.append((ts, 0, "send", ev, i))
+            if ev != drop:
+                events.append((ts + rnd.uniform(0.0005, 0.02), 1,
+                               "recv", ev, i))
+        k = 1
+        while k * self.W < dur_s + 1:
+            events.append((k * self.W, 2, "rotate", None, 0))
+            events.append((k * self.W + phase, 3, "report", None, 0))
+            k += 1
+        events.sort()
+        cur = [[0] * n_q for _ in range(n_p)]
+        start = 0.0
+        for ts, _, kind, ev, seq in events:
+            if kind == "send":
+                cur[ev[0]][ev[1]] += 1
+            elif kind == "recv":
+                rx.record("f", ev[0], ev[1], seq)
+            elif kind == "rotate":
+                ring.push(SentWindow(start_ns=int(start * 1e9),
+                                     end_ns=int(ts * 1e9),
+                                     sent=tuple(map(tuple, cur))))
+                cur = [[0] * n_q for _ in range(n_p)]
+                start = ts
+            else:
+                apply_loss_report(
+                    table=t, tenant="g",
+                    report=rx.snapshot_and_reset("f"), sent_ring=ring,
+                    received_at_ns=int((ts + 0.001) * 1e9),
+                    max_window_skew_ns=self.SKEW_NS,
+                )
+        return t, evs
+
+    def test_healthy_fabric_never_demotes(self):
+        for rate in (100, 500):
+            for seed in range(5):
+                t, evs = self._run(rate_pps=rate, seed=seed)
+                bad = [ev for ev in evs
+                       if t.state("g", *ev) is EVState.ASSUMED_BAD]
+                self.assertEqual(bad, [], f"rate={rate} seed={seed}")
+
+    def test_blackholed_ev_demoted_at_scenario_rate(self):
+        for seed in range(5):
+            t, _ = self._run(rate_pps=100, seed=seed, drop=(2, 1))
+            self.assertIs(t.state("g", 2, 1), EVState.ASSUMED_BAD,
+                          f"seed={seed}")
 
 
 if __name__ == "__main__":

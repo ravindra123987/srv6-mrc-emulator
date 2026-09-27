@@ -55,9 +55,8 @@ Invariants
   appears in a report. When the report is non-empty (the receiver is
   alive and hearing this flow) and pairs with a SentWindow in which we
   sent at least `MIN_SENT_FOR_ABSENT_LOSS` packets on an EV that is
-  absent from it, that EV is recorded as 100% loss. Fewer sends than
-  that could all straddle the receiver's window edge, so they carry no
-  signal. The whole inference is skipped unless the report's total
+  absent from it, that EV is recorded as 100% loss. A single send can
+  straddle the receiver's window edge, so it carries no signal. The whole inference is skipped unless the report's total
   `seen` covers at least `MIN_COVERAGE_FOR_ABSENT_LOSS` of the paired
   window's total sent: a receiver window that caught only a slice of
   the sender's (window-phase skew, a burst straddling the boundary)
@@ -81,10 +80,13 @@ from .probe import LossReport
 
 
 # Minimum packets sent on an EV in the paired window before its absence
-# from a non-empty LOSS_REPORT counts as total loss. At lab rates each
-# EV carries ~5 packets per 200 ms window; 1-2 can land entirely in the
-# receiver's neighbouring window.
-MIN_SENT_FOR_ABSENT_LOSS = 3
+# from a non-empty LOSS_REPORT counts as total loss. A lone packet can
+# land entirely in the receiver's neighbouring window. The committed MRC
+# scenarios run 100 pps over 16 EVs, ~1.9 packets per EV per 300 ms
+# window, so anything above 2 would leave a blackhole undetected there;
+# loss_demote_consecutive (3) absorbs the occasional straddle (see
+# tests/test_mrc_agent_logic.py::TestLossPathTimeline).
+MIN_SENT_FOR_ABSENT_LOSS = 2
 # Minimum report.seen / paired.sent (all EVs) before absent EVs are
 # inferred lost. Below this the two windows don't cover the same
 # traffic, so absence says nothing. At most half the EVs can be demoted
