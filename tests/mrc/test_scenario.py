@@ -434,6 +434,43 @@ flows:
             scenario.from_yaml_string(text)
 
 
+class TestTransport(unittest.TestCase):
+    """Top-level scenario `transport: udp|rdma` field."""
+
+    _BASE = """
+name: x
+flows:
+  - pairs: green-pairs-8
+    policy: round_robin
+    rate: 1000pps
+    duration: 5s
+"""
+
+    def test_absent_defaults_to_none(self):
+        s = scenario.from_yaml_string(self._BASE)
+        self.assertIsNone(s.transport)
+
+    def test_udp_accepted(self):
+        text = self._BASE + "transport: udp\n"
+        s = scenario.from_yaml_string(text)
+        self.assertEqual(s.transport, "udp")
+
+    def test_rdma_accepted(self):
+        text = self._BASE + "transport: rdma\n"
+        s = scenario.from_yaml_string(text)
+        self.assertEqual(s.transport, "rdma")
+
+    def test_bad_value_rejected(self):
+        text = self._BASE + "transport: tcp\n"
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.from_yaml_string(text)
+
+    def test_bool_rejected(self):
+        text = self._BASE + "transport: true\n"
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.from_yaml_string(text)
+
+
 # --- public CLI helpers ----------------------------------------------------
 
 class TestParseDurationStr(unittest.TestCase):
@@ -497,6 +534,28 @@ class TestOverrideDuration(unittest.TestCase):
             self.assertEqual(orig.pairs, new.pairs)
             self.assertEqual(orig.policy_spec, new.policy_spec)
             self.assertEqual(orig.rate_pps, new.rate_pps)
+
+
+class TestOverrideTransport(unittest.TestCase):
+    """`scenario.override_transport(scenario, t)` — mirrors
+    `override_sid_mode`: a single top-level field, not per-flow."""
+
+    def test_sets_transport(self):
+        s = scenario.validate(MINIMAL)
+        self.assertIsNone(s.transport)
+        s2 = scenario.override_transport(s, "rdma")
+        self.assertEqual(s2.transport, "rdma")
+
+    def test_does_not_mutate_original(self):
+        s = scenario.validate(MINIMAL)
+        _ = scenario.override_transport(s, "rdma")
+        self.assertIsNone(s.transport)
+
+    def test_preserves_other_fields(self):
+        s = scenario.validate(MINIMAL)
+        s2 = scenario.override_transport(s, "rdma")
+        self.assertEqual(s2.name, s.name)
+        self.assertEqual(s2.flows, s.flows)
 
 
 if __name__ == "__main__":

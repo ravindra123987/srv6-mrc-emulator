@@ -1,0 +1,95 @@
+"""RoCEv2 (RDMA over Converged Ethernet v2) payload framing.
+
+Wraps/unwraps the spray data path's existing payload
+(`runner.encode_payload`) inside a real RoCEv2 BTH (Base Transport
+Header), so `--transport rdma` traffic looks like genuine RDMA on the
+wire — UDP dport=`topo.RDMA_PORT` (4791, the real IANA-assigned RoCEv2
+port), a real opcode, an incrementing PSN — while MRC's own
+`(seq, plane, path)` accounting, decoded by `runner.parse_payload`,
+travels unchanged as the BTH's payload.
+
+This is "Option A" from the RDMA feature design discussion: BTH is a
+skin over the existing accounting struct, not a replacement for it.
+`psn` and `dqpn` are populated from the same `(seq, plane, path)`
+triple the struct already carries (`psn` = `seq` truncated to 24 bits;
+`dqpn` = `topo.dqpn_for_ev(plane, path)`), so a future "Option B" (BTH
+fields become the actual accounting mechanism) is a pure subtraction —
+drop the now-redundant struct fields, read psn/dqpn instead — not a
+wire-format change.
+
+Transport modeled: UD (unreliable datagram) SEND_ONLY. UD is the right
+fit for MRC-sprayed traffic — no ACK/NAK is expected per packet
+(matches MRC's own out-of-band loss-report design), and UD's only
+opcode family is SEND, so no RETH (remote addr/rkey/length, needed for
+RC/UC WRITE/READ) is required.
+
+Known simplification: the BTH `icrc` trailer is computed by scapy over
+just the BTH+payload bytes built here, with no UDP/IPv6 underlayer
+visible yet (that gets added later by `encap.build_outer_packet`). Real
+RoCEv2 ICRC also covers a pseudo-header derived from the UDP/IPv6
+wrapper, so ours will not match what a real RDMA NIC would compute.
+Nothing in this emulator validates ICRC (no real RDMA hardware is
+present), so this is cosmetic — flagged here rather than engineered
+away, since fixing it would mean threading addresses/ports through
+this module for zero functional benefit.
+
+Scapy is lazy-imported inside each function (see `encap.py`'s
+docstring for why): this module must import cleanly on the
+orchestrator side, which has no scapy installed.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from .topo import dqpn_for_ev
+
+# UD (unreliable datagram) SEND_ONLY. In scapy.contrib.roce's own
+# encoding this is opcode('UD', 'SEND_ONLY') = _transports['UD'] (0x60)
+# + _ops['SEND_ONLY'] (0x04); hardcoded here rather than importing
+# those (underscore-prefixed, not a public scapy API).
+RDMA_OPCODE = 0x64  # UD_SEND_ONLY
+
+
+def wrap_rdma(payload: bytes, *, plane: int, path: int, seq: int) -> bytes:
+    """Wrap `payload` (runner.encode_payload's bytes) in a RoCEv2 BTH frame.
+
+    `seq` becomes the BTH PSN, truncated to its 24-bit field (real PSNs
+    wrap the same way over a long-running QP); `plane`/`path` become
+    `dqpn` via `topo.dqpn_for_ev`. Returned bytes are ready to pass as
+    the `payload=` argument to `encap.build_outer_packet(..., dport=
+    topo.RDMA_PORT, ...)`.
+    """
+    import logging as _logging
+    _logging.getLogger("scapy.runtime").setLevel(_logging.ERROR)
+    from scapy.contrib.roce import BTH  # type: ignore
+    from scapy.packet import Raw  # type: ignore
+
+    bth = BTH(
+        opcode=RDMA_OPCODE,
+        dqpn=dqpn_for_ev(plane, path),
+        psn=seq & 0xFFFFFF,
+    )
+    return bytes(bth / Raw(payload))
+
+
+def unwrap_rdma(raw: bytes) -> Optional[bytes]:
+    """Strip a RoCEv2 BTH frame, returning the inner payload bytes.
+
+    Returns None if `raw` doesn't parse as a BTH-framed payload (too
+    short, no trailing Raw layer) — the caller (`runner.run_receiver`)
+    treats that the same as any other malformed packet: drop and keep
+    counting.
+    """
+    import logging as _logging
+    _logging.getLogger("scapy.runtime").setLevel(_logging.ERROR)
+    from scapy.contrib.roce import BTH  # type: ignore
+    from scapy.packet import Raw  # type: ignore
+
+    try:
+        pkt = BTH(raw)
+    except Exception:
+        return None
+    if Raw not in pkt:
+        return None
+    return bytes(pkt[Raw])

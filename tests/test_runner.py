@@ -127,6 +127,18 @@ class TestSenderResult(unittest.TestCase):
         keys = list(r.to_dict()["per_plane_sent"].keys())
         self.assertEqual(keys, [0, 1, 2, 3])
 
+    def test_transport_defaults_to_udp_in_dict(self):
+        f = FlowEndpoint("green", 0, 15)
+        r = SenderResult(flow=f, policy="round_robin",
+                         rate_pps=100, duration_s=1.0)
+        self.assertEqual(r.to_dict()["transport"], "udp")
+
+    def test_transport_rdma_reflected_in_dict(self):
+        f = FlowEndpoint("green", 0, 15)
+        r = SenderResult(flow=f, policy="round_robin",
+                         rate_pps=100, duration_s=1.0, transport="rdma")
+        self.assertEqual(r.to_dict()["transport"], "rdma")
+
 
 class TestHostFor(unittest.TestCase):
 

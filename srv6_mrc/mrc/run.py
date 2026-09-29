@@ -84,7 +84,7 @@ from srv6_mrc.netem import Fault, Netem
 from srv6_mrc.report import ScenarioReport
 from srv6_mrc.mrc.scenario import (
     MrcSpec, Scenario, from_yaml_file, override_duration, override_sid_mode,
-    parse_duration_str,
+    override_transport, parse_duration_str,
 )
 from srv6_mrc.topo import (current_topology, inner_addr,
                               select_spines_for_addrs, usid_outer_dst)
@@ -275,20 +275,24 @@ def _recv_argv(idle_timeout_s: float, *, mrc: bool) -> list[str]:
 
 def _scenario_env(mrc: MrcSpec | None,
                   paths_per_plane: int | None,
-                  sid_mode: str | None = None) -> dict[str, str] | None:
+                  sid_mode: str | None = None,
+                  transport: str | None = None) -> dict[str, str] | None:
     """Build the env dict passed to docker exec for a scenario run.
 
     Bundles MRC tunables (SRV6_MRC_CONFIG_JSON), the EV-spray fan-out
-    override (SRV6_PATHS_PER_PLANE), and the outer-uSID mode
-    (SRV6_SID_MODE). Returns None when none of these are set, so plain
-    scenarios see no -e flags and the on-wire behavior is unchanged.
+    override (SRV6_PATHS_PER_PLANE), the outer-uSID mode
+    (SRV6_SID_MODE), and the inner payload framing (SRV6_TRANSPORT).
+    Returns None when none of these are set, so plain scenarios see no
+    -e flags and the on-wire behavior is unchanged.
 
     paths_per_plane and sid_mode are propagated even when MRC is
     disabled, because EV-spray fan-out and uSID construction are
     sender/receiver-side concerns independent of the MRC probe/EV
     state machine. sid_mode also reaches receivers (and any MRC
     daemon), since loss-report traffic uses the same usid_outer_dst
-    call as data packets.
+    call as data packets. transport only matters to spray.py's send
+    role (receivers auto-detect framing from the packet's UDP dport),
+    but is set in this shared env regardless, same as the others.
     """
     env: dict[str, str] = {}
     if mrc is not None:
@@ -297,6 +301,8 @@ def _scenario_env(mrc: MrcSpec | None,
         env["SRV6_PATHS_PER_PLANE"] = str(paths_per_plane)
     if sid_mode is not None:
         env["SRV6_SID_MODE"] = sid_mode
+    if transport is not None:
+        env["SRV6_TRANSPORT"] = transport
     # Passthrough diagnostic flags from the orchestrator's env into the
     # sender/receiver containers. Used today only for transition
     # logging; opt-in (only forwarded when set on the host).
@@ -411,6 +417,7 @@ def run_flows(flows: list[FlowRun], *,
               mrc: MrcSpec | None = None,
               paths_per_plane: int | None = None,
               sid_mode: str | None = None,
+              transport: str | None = None,
               verbose: bool = False) -> tuple[list[dict], list[dict], list[dict]]:
     """Run all flows concurrently. Returns (sender_records, receiver_records,
     daemon_records).
@@ -452,7 +459,7 @@ def run_flows(flows: list[FlowRun], *,
     max_dur = max((f.duration_s for f in flows), default=0.0)
     recv_max_wait = max_dur + idle_timeout_s + 30.0
 
-    env = _scenario_env(mrc, paths_per_plane, sid_mode)
+    env = _scenario_env(mrc, paths_per_plane, sid_mode, transport)
     mrc_enabled = mrc is not None
 
     if verbose:
@@ -814,6 +821,7 @@ def run_scenario(scenario: Scenario, *,
         else:
             print(f"    enabled, env=SRV6_MRC_CONFIG_JSON={scenario.mrc.to_env_json()}")
         print(f"  sid: {scenario.sid or 'uA'}")
+        print(f"  transport: {scenario.transport or 'udp'}")
         print(f"  flows:")
         for fr in flows:
             print(f"    {fr.src_host} -> {fr.dst_host}  "
@@ -861,6 +869,7 @@ def run_scenario(scenario: Scenario, *,
         if scenario.mrc is not None:
             print(f"  mrc: enabled (env={scenario.mrc.to_env_json()})")
         print(f"  sid: {scenario.sid or 'uA'}")
+        print(f"  transport: {scenario.transport or 'udp'}")
         _print_ev_preview(flows, scenario.paths_per_plane, scenario.sid)
         if scenario.faults:
             print(f"  applying {len(scenario.faults)} fault(s)...")
@@ -873,6 +882,7 @@ def run_scenario(scenario: Scenario, *,
             flows, mrc=scenario.mrc,
             paths_per_plane=scenario.paths_per_plane,
             sid_mode=scenario.sid,
+            transport=scenario.transport,
             verbose=verbose,
         )
     finally:
@@ -919,6 +929,12 @@ def main(argv: list[str] | None = None) -> int:
                         "specific physical link via per-adjacency SIDs; "
                         "uN uses each hop's own node locator instead. "
                         "Applied after YAML parse, before run.")
+    p.add_argument("--transport", choices=("udp", "rdma"), default=None,
+                   help="override the scenario's inner payload framing: "
+                        "udp (default) is today's plain UDP payload; rdma "
+                        "wraps the same payload in a real RoCEv2 BTH "
+                        "header (see srv6_mrc.rdma). Applied after YAML "
+                        "parse, before run.")
     args = p.parse_args(argv)
 
     try:
@@ -935,6 +951,8 @@ def main(argv: list[str] | None = None) -> int:
         scenario = override_duration(scenario, args.duration)
     if args.sid is not None:
         scenario = override_sid_mode(scenario, args.sid)
+    if args.transport is not None:
+        scenario = override_transport(scenario, args.transport)
 
     try:
         report = run_scenario(scenario, dry_run=args.dry_run,

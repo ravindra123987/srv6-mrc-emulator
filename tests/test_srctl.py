@@ -261,6 +261,22 @@ class TestRun(unittest.TestCase):
         argv = m.call_args[0][0]
         self.assertNotIn("--duration", argv)
 
+    def test_transport_flag_forwarded(self):
+        with mock.patch("srv6_mrc.mrc.run.main", return_value=0) as m:
+            rc, _, _ = _run(["run", "green-mrc-baseline", "--transport", "rdma"])
+        self.assertEqual(rc, 0)
+        argv = m.call_args[0][0]
+        self.assertIn("--transport", argv)
+        i = argv.index("--transport")
+        self.assertEqual(argv[i + 1], "rdma")
+
+    def test_transport_flag_absent_when_unset(self):
+        with mock.patch("srv6_mrc.mrc.run.main", return_value=0) as m:
+            rc, _, _ = _run(["run", "green-mrc-baseline"])
+        self.assertEqual(rc, 0)
+        argv = m.call_args[0][0]
+        self.assertNotIn("--transport", argv)
+
 
 if __name__ == "__main__":
     unittest.main()
