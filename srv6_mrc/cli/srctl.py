@@ -10,7 +10,7 @@ Subcommand surface (v1):
     srctl get topology
     srctl get hosts [--tenant T]
     srctl get evs <src-host> <dst-host> [-n N] [-o table|json|yaml|sid] [--sid uA|uN]
-    srctl run <scenario> [--verbose] [--dry-run] [--sid uA|uN]
+    srctl run <scenario> [--verbose] [--dry-run] [--sid uA|uN] [--transport udp|rdma]
     srctl run --list
 
 `--sid` selects the outer uSID construction: `uA` (default) uses
@@ -18,6 +18,12 @@ per-adjacency SIDs that force each fabric hop onto one specific
 physical link; `uN` uses each hop's own node locator instead, letting
 the underlay's (already-provisioned) static routes pick the link. See
 `srv6_mrc.topo.usid_outer_dst` for the addressing detail.
+
+`--transport` selects the data path's inner payload framing: `udp`
+(default) is today's plain UDP payload; `rdma` wraps the same payload
+in a real RoCEv2 BTH header so captures look like genuine RDMA
+traffic. Orthogonal to `--sid` — either uSID construction works with
+either transport. See `srv6_mrc.rdma`.
 
 `<scenario>` is resolved by name against the active topology's
 `scenarios/` directory: `srctl run green-mrc-ev-spray` finds
@@ -461,6 +467,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         forwarded.extend(["--duration", args.duration])
     if args.sid is not None:
         forwarded.extend(["--sid", args.sid])
+    if args.transport is not None:
+        forwarded.extend(["--transport", args.transport])
     return run_main(forwarded)
 
 
@@ -729,6 +737,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="override the scenario's outer uSID construction "
                         "(uA=per-adjacency default, uN=node-locator); "
                         "forwarded to run-scenario")
+    r.add_argument("--transport", choices=("udp", "rdma"), default=None,
+                   help="override the scenario's inner payload framing "
+                        "(udp=plain payload default, rdma=RoCEv2 "
+                        "BTH-wrapped); forwarded to run-scenario")
     r.set_defaults(func=_cmd_run)
 
     # --- fault --------------------------------------------------------

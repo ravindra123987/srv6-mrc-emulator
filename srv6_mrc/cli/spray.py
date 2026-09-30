@@ -30,6 +30,8 @@ Optional flags:
     --policy {round_robin,hash5tuple,weighted:0.4,0.3,0.2,0.1,health_aware_mrc}
     --sid {uA,uN}       outer uSID construction (default uA); see
                         `srv6_mrc.topo.usid_outer_dst`
+    --transport {udp,rdma}  (send) inner payload framing (default udp); see
+                        `srv6_mrc.rdma`
     --mrc               (recv) start MRC receiver agent (probe responder +
                         per-plane loss reporter); sender side auto-starts
                         a SenderMrcAgent when --policy=health_aware_mrc
@@ -102,6 +104,27 @@ def _resolve_sid_mode(args) -> tuple[str | None, int]:
         mode = env_mode
     if getattr(args, "sid", None) is not None:
         mode = args.sid
+    return mode, 0
+
+
+def _resolve_transport(args) -> tuple[str | None, int]:
+    """Resolve --transport: CLI flag wins over SRV6_TRANSPORT env, env
+    wins over the "udp" default. Mirrors `_resolve_sid_mode`.
+
+    Returns (transport, exit_code). On a bad env value, transport is
+    None and exit_code is nonzero — caller should `return` it
+    immediately.
+    """
+    mode = "udp"
+    env_mode = os.environ.get("SRV6_TRANSPORT")
+    if env_mode:
+        if env_mode not in ("udp", "rdma"):
+            print(f"spray.py: SRV6_TRANSPORT={env_mode!r} must be 'udp' "
+                  f"or 'rdma'", file=sys.stderr)
+            return None, 2
+        mode = env_mode
+    if getattr(args, "transport", None) is not None:
+        mode = args.transport
     return mode, 0
 
 
@@ -314,6 +337,10 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
     if rc:
         return rc
 
+    transport, rc = _resolve_transport(args)
+    if rc:
+        return rc
+
     policy = parse_policy(
         args.policy, tenant=tenant, ev_config=ev_cfg, paths_per_plane=ppp,
         src_host_id=my_id,
@@ -347,6 +374,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
               f"src=host{my_id:02d}  dst=host{args.dst_id:02d}")
         print(f"               spine=p<P>-spine{spine:02d}  "
               f"policy={policy.name}  sid={sid_mode}  "
+              f"transport={transport}  "
               f"rate={args.rate}pps  duration={args.duration}s")
         print(f"               inner: {src_inner} -> {dst_inner}")
         for p in range(NUM_PLANES):
@@ -362,7 +390,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
     try:
         result = run_sender(
             flow, policy, args.rate, args.duration,
-            progress_cb=progress_cb, sid_mode=sid_mode,
+            progress_cb=progress_cb, sid_mode=sid_mode, transport=transport,
         )
     finally:
         # Capture EV-state + fusion-stats BEFORE stop() so the snapshot
@@ -711,6 +739,16 @@ def main() -> int:
                         "letting the already-provisioned underlay static "
                         "routes pick the link. CLI flag wins over "
                         "SRV6_SID_MODE env, env wins over 'uA'.")
+    p.add_argument("--transport", choices=("udp", "rdma"), default=None,
+                   help="(send) inner payload framing: udp (default) is "
+                        "today's plain UDP data payload; rdma wraps the "
+                        "same payload in a real RoCEv2 BTH header (UD "
+                        "SEND_ONLY, dport=4791) so captures look like "
+                        "genuine RDMA traffic — see srv6_mrc.rdma. "
+                        "Receivers auto-detect either framing from the "
+                        "packet's UDP dport, so --transport is send-only. "
+                        "CLI flag wins over SRV6_TRANSPORT env, env wins "
+                        "over 'udp'.")
     p.add_argument("--idle-timeout", type=parse_duration,
                    default=parse_duration("6s"),
                    help="(recv) auto-exit after this much silence "

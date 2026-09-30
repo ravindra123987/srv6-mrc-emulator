@@ -173,6 +173,46 @@ SPRAY_PORT = 9999
 SPRAY_PROBE_PORT = 9998   # MRC EV Probe / Probe Reply (see mrc/probe.py)
 SPRAY_REPORT_PORT = 9997  # MRC receiver loss-feedback report
 
+# --- transport (inner payload framing) --------------------------------------
+
+# "udp": today's plain UDP data-payload spray (unchanged default).
+# "rdma": same spray/EV/loss-detection engine, but the inner UDP payload
+# is a real RoCEv2 frame (see srv6_mrc.rdma) — dport=RDMA_PORT, a BTH
+# header wrapping the existing payload struct. Scoped to the data path
+# only; MRC's own probe/loss-report control traffic is unaffected (same
+# scope decision as sid_mode's uA-only probes).
+TRANSPORTS: tuple[str, ...] = ("udp", "rdma")
+
+
+def _check_transport(v: str) -> None:
+    if v not in TRANSPORTS:
+        raise ValueError(f"transport must be one of {TRANSPORTS}, got {v!r}")
+
+
+# RoCEv2's IANA-assigned UDP destination port. scapy.contrib.roce binds
+# UDP(dport=RDMA_PORT) to its BTH layer, so a real RoCEv2-aware sniffer
+# (or scapy itself) dissects transport="rdma" packets correctly. Plain
+# UDP data/loss traffic always uses SPRAY_PORT above.
+RDMA_PORT = 4791
+
+
+def dqpn_for_ev(plane: int, path: int) -> int:
+    """Encode (plane, path) into a 24-bit RoCEv2 destination QP number.
+
+    Real RDMA QPNs carry no topological meaning; this emulator
+    deliberately makes dqpn double as EV identity, so a BTH-aware
+    reader can recover which EV a packet belongs to without decoding
+    SRv6 outer state. `path` is the spine index (== MRC path_id).
+    """
+    _check_plane(plane)
+    _check_spine(path)
+    return (plane << 8) | path
+
+
+def ev_from_dqpn(dqpn: int) -> tuple[int, int]:
+    """Inverse of `dqpn_for_ev`. Returns (plane, path)."""
+    return (dqpn >> 8) & 0xFF, dqpn & 0xFF
+
 # Reference (lo, hi) host-pair -> chosen transit spine. Used by the
 # spray.py demo and routes.py to pick a deterministic transit spine for
 # well-known test pairs. Other pairs fall back to a hash; see

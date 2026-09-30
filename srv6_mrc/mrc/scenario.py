@@ -27,6 +27,7 @@ Validates the full scenario shape laid out in mrc/README.md:
     report:                          # optional
       out: <path>
     sid: uA|uN                       # optional; default uA (see below)
+    transport: udp|rdma              # optional; default udp (see below)
 
 The validator is intentionally strict — unknown keys raise. This catches
 typos like `paris:` vs `pairs:` before a long lab run.
@@ -54,7 +55,7 @@ from typing import Any
 
 from ..netem import normalize_spec, parse_target
 from ..policy import policy_from_spec
-from ..topo import (NUM_LEAVES, NUM_SPINES, SID_MODES, TENANTS,
+from ..topo import (NUM_LEAVES, NUM_SPINES, SID_MODES, TENANTS, TRANSPORTS,
                    current_topology, host_name)
 
 
@@ -167,6 +168,14 @@ class Scenario:
     # SRV6_SID_MODE env var or the --sid CLI flag (mrc/run.py main()
     # overrides the scenario value the same way --duration does).
     sid: str | None = None
+    # Inner payload framing for the data path in this scenario: "udp"
+    # (default) or "rdma" (RoCEv2 BTH-wrapped; see srv6_mrc.rdma). None
+    # means "use the udp default". Plumbed through to spray.py's send
+    # role via the SRV6_TRANSPORT env var or the --transport CLI flag
+    # (mrc/run.py main() overrides the scenario value the same way
+    # --sid does). Orthogonal to sid — receivers auto-detect either
+    # framing, so this only affects sender-side flows.
+    transport: str | None = None
 
 
 # --- named pair sets --------------------------------------------------------
@@ -277,7 +286,7 @@ def validate(doc: Any) -> Scenario:
 
     _require_keys(doc, "$", required={"name", "flows"},
                   optional={"description", "faults", "report", "mrc",
-                            "paths_per_plane", "sid"})
+                            "paths_per_plane", "sid", "transport"})
 
     name = _require_str(doc, "$.name")
     description = _opt_str(doc, "$.description", default="")
@@ -302,6 +311,7 @@ def validate(doc: Any) -> Scenario:
     )
 
     sid = _validate_sid_mode(doc.get("sid"), "$.sid")
+    transport = _validate_transport(doc.get("transport"), "$.transport")
 
     return Scenario(
         name=name,
@@ -312,6 +322,7 @@ def validate(doc: Any) -> Scenario:
         mrc=mrc,
         paths_per_plane=paths_per_plane,
         sid=sid,
+        transport=transport,
     )
 
 
@@ -468,6 +479,21 @@ def _validate_sid_mode(value: Any, path: str) -> str | None:
     if not isinstance(value, str) or value not in SID_MODES:
         raise ScenarioError(
             path, f"must be one of {SID_MODES}, got {value!r}"
+        )
+    return value
+
+
+def _validate_transport(value: Any, path: str) -> str | None:
+    """Validate top-level scenario `transport: udp|rdma` if present.
+
+    Returns None when absent (means "use the udp default at runtime");
+    raises ScenarioError on any value outside topo.TRANSPORTS.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in TRANSPORTS:
+        raise ScenarioError(
+            path, f"must be one of {TRANSPORTS}, got {value!r}"
         )
     return value
 
@@ -645,6 +671,17 @@ def override_sid_mode(scenario: "Scenario", sid_mode: str) -> "Scenario":
     """
     import dataclasses
     return dataclasses.replace(scenario, sid=sid_mode)
+
+
+def override_transport(scenario: "Scenario", transport: str) -> "Scenario":
+    """Return a copy of `scenario` with `transport` set.
+
+    Mirrors `override_sid_mode`. Caller (mrc/run.py main()) validates
+    `transport` against topo.TRANSPORTS via the --transport argparse
+    `choices=` before calling this.
+    """
+    import dataclasses
+    return dataclasses.replace(scenario, transport=transport)
 
 
 def _load_pyyaml():

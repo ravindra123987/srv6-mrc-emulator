@@ -21,6 +21,13 @@ Layering rules:
     socket (`SO_BINDTODEVICE` per Invariant 8). Don't change this
     without coordinating with `srv6_mrc/mrc/transport.py` — MRC
     probes use the same encap helper.
+  - Wire format, transport="rdma" (`--transport rdma`): identical
+    outer/inner IPv6, but the inner UDP uses dport=RDMA_PORT and the
+    !QBB struct above travels inside a real RoCEv2 BTH header (see
+    `srv6_mrc.rdma`) instead of bare. MRC's own (seq, plane, path)
+    accounting is unchanged either way; `run_receiver` auto-detects
+    which framing a packet uses from its UDP dport, so a receiver
+    process needs no transport flag of its own.
 
 Public API:
   - run_sender(flow, policy, rate_pps, duration_s) -> SenderResult
@@ -45,7 +52,7 @@ from typing import Optional
 from .policy import SprayPolicy
 from .reorder import ReorderTracker
 from .topo import (
-    NUM_PLANES, SPRAY_PORT, PLANE_NICS,
+    NUM_PLANES, RDMA_PORT, SPRAY_PORT, PLANE_NICS,
     FlowKey, host_underlay_addr, inner_addr, spine_for, usid_outer_dst,
 )
 
@@ -109,6 +116,11 @@ class SenderResult:
     # (per-adjacency, default) or "uN" (node-locator). See
     # `topo.usid_outer_dst` for the addressing rationale.
     sid_mode: str = "uA"
+    # Inner payload framing for every packet in this run: "udp"
+    # (default, unchanged) or "rdma" (RoCEv2 BTH-wrapped; see
+    # `srv6_mrc.rdma`). Orthogonal to sid_mode — either uSID
+    # construction works with either transport.
+    transport: str = "udp"
 
     def to_dict(self) -> dict:
         return {
@@ -120,6 +132,7 @@ class SenderResult:
             "duration_s": self.duration_s,
             "spine": self.spine,
             "sid_mode": self.sid_mode,
+            "transport": self.transport,
             "sent": self.sent,
             "elapsed_s": round(self.elapsed_s, 3),
             "per_plane_sent": dict(sorted(self.per_plane_sent.items())),
@@ -209,7 +222,8 @@ def _open_send_socket(iface: str) -> socket.socket:
 
 def _build_packet_bytes(src_underlay: str, dst_outer: str,
                         src_inner: str, dst_inner: str,
-                        seq: int, plane: int, path: int) -> bytes:
+                        seq: int, plane: int, path: int,
+                        transport: str = "udp") -> bytes:
     """Build full outer/inner/UDP bytes for one spray DATA packet.
 
     Thin wrapper around `srv6_mrc.encap.build_outer_packet` that
@@ -217,16 +231,28 @@ def _build_packet_bytes(src_underlay: str, dst_outer: str,
     MRC probe path uses the same builder with different ports and a
     PROBE / PROBE_REPLY / LOSS_REPORT payload — see
     `srv6_mrc.mrc.agent`.
+
+    transport="rdma" wraps the same MRC accounting payload in a
+    RoCEv2 BTH header (see `srv6_mrc.rdma.wrap_rdma`) and uses
+    RDMA_PORT instead of SPRAY_PORT for the inner UDP dport.
     """
     from .encap import build_outer_packet
+    mrc_payload = encode_payload(seq, plane, path)
+    if transport == "rdma":
+        from .rdma import wrap_rdma
+        payload = wrap_rdma(mrc_payload, plane=plane, path=path, seq=seq)
+        dport = RDMA_PORT
+    else:
+        payload = mrc_payload
+        dport = SPRAY_PORT
     return build_outer_packet(
         src_underlay=src_underlay,
         dst_outer=dst_outer,
         src_inner=src_inner,
         dst_inner=dst_inner,
         sport=SPRAY_PORT,
-        dport=SPRAY_PORT,
-        payload=encode_payload(seq, plane, path),
+        dport=dport,
+        payload=payload,
     )
 
 
@@ -237,7 +263,8 @@ def run_sender(flow: FlowEndpoint,
                *,
                stop_event: Optional[threading.Event] = None,
                progress_cb=None,
-               sid_mode: str = "uA") -> SenderResult:
+               sid_mode: str = "uA",
+               transport: str = "udp") -> SenderResult:
     """Run a single-flow sender loop with the given policy.
 
     Args:
@@ -250,6 +277,8 @@ def run_sender(flow: FlowEndpoint,
             (debug / sender-side MRC bookkeeping)
         sid_mode: "uA" (default) or "uN" — outer uSID construction for
             every packet; see `topo.usid_outer_dst`.
+        transport: "udp" (default) or "rdma" — inner payload framing
+            for every packet; see `srv6_mrc.rdma`.
 
     Returns: SenderResult
     """
@@ -287,7 +316,7 @@ def run_sender(flow: FlowEndpoint,
         result = SenderResult(
             flow=flow, policy=policy.name,
             rate_pps=rate_pps, duration_s=duration_s, spine=spine,
-            sid_mode=sid_mode,
+            sid_mode=sid_mode, transport=transport,
         )
 
         interval = 1.0 / rate_pps if rate_pps > 0 else 0.0
@@ -324,7 +353,7 @@ def run_sender(flow: FlowEndpoint,
                     src_u, outer_d, sa = plane_meta[plane]
                 pkt = _build_packet_bytes(
                     src_u, outer_d, src_inner, dst_inner,
-                    seq, plane, ev_spine,
+                    seq, plane, ev_spine, transport=transport,
                 )
                 try:
                     sockets[plane].sendto(pkt, sa)
@@ -435,7 +464,21 @@ def run_receiver(self_host: str,
             inner_src = outer.src
             inner_dst = outer.dst
 
-        if udp.dport != SPRAY_PORT:
+        # Auto-detect framing by dport: plain UDP data spray (SPRAY_PORT)
+        # carries the accounting struct bare; RDMA-transport spray
+        # (RDMA_PORT) wraps it in a RoCEv2 BTH header (see
+        # `srv6_mrc.rdma`). No transport flag needed on the receiver —
+        # it demuxes whichever framing arrives, so a single receiver
+        # process handles both without configuration.
+        if udp.dport == SPRAY_PORT:
+            raw_payload = bytes(udp.payload)
+        elif udp.dport == RDMA_PORT:
+            from .rdma import unwrap_rdma
+            unwrapped = unwrap_rdma(bytes(udp.payload))
+            if unwrapped is None:
+                return
+            raw_payload = unwrapped
+        else:
             return
 
         # Drop egress observations: the sniffer captures this host's own
@@ -447,7 +490,7 @@ def run_receiver(self_host: str,
         if not _should_count_inner(inner_dst, self_inner_canon):
             return
 
-        parsed = parse_payload(bytes(udp.payload))
+        parsed = parse_payload(raw_payload)
         if parsed is None:
             return
         seq, plane, path = parsed
@@ -470,7 +513,7 @@ def run_receiver(self_host: str,
                     "run_receiver on_packet hook raised %s; ignoring", e,
                 )
 
-    bpf = f"ip6 proto 41 or udp port {SPRAY_PORT}"
+    bpf = f"ip6 proto 41 or udp port {SPRAY_PORT} or udp port {RDMA_PORT}"
     sniffers = []
     try:
         for nic in nics:
