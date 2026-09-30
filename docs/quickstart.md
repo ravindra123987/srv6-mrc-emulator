@@ -307,6 +307,22 @@ srctl run yellow-baseline
 srctl run yellow-all-to-all --sid uN
 ```
 
+4. Run with synthetic RDMA traffic (RoCEv2)
+```bash
+srctl run yellow-allreduce-ring --transport rdma
+```
+
+>[!Note]
+> `--transport rdma` wraps the same spray/MRC accounting payload in a real RoCEv2 BTH
+> header (UD SEND_ONLY, UDP destination port 4791) instead of a bare UDP payload, so
+> captures look like genuine RDMA traffic. It's orthogonal to `--sid` — either uSID
+> mode works with either transport. Receivers auto-detect the framing from the
+> packet's UDP destination port, so `--transport` only needs to be passed to `run`
+> (the sender side). Default is `udp` (today's behavior, unchanged). See
+> `srv6_mrc/rdma.py` for the encoding details, and
+> [Inspecting RoCEv2 traffic](#inspecting-rocev2---transport-rdma-traffic) below to
+> see the BTH header on the wire.
+
 5. Other options:
 ```bash
 srctl run yellow-allreduce-ring --verbose
@@ -326,6 +342,53 @@ docker exec -it p2-spine01 tcpdump -ni Ethernet20
 
 # etc
 ```
+
+### Inspecting RoCEv2 (`--transport rdma`) traffic
+
+`tcpdump`'s one-line summary only shows plain UDP; to actually see the RoCEv2 BTH
+header fields (opcode, destination QP, packet sequence number) you need a capture
+that keeps the full bytes plus a dissector that understands RoCEv2 — Wireshark (and
+its CLI counterpart, `tshark`) both do.
+
+1. Capture a pcap on a data-plane NIC while a `--transport rdma` scenario runs. Start
+   the capture first, in one terminal:
+```bash
+docker exec yellow-host01 tcpdump -i eth1 -w /tmp/rdma.pcap udp port 4791
+```
+   then run the scenario in another terminal:
+```bash
+srctl run yellow-allreduce-ring --transport rdma
+```
+   Stop the capture (Ctrl-C) once the scenario finishes, then pull the file off the
+   lab host:
+```bash
+docker cp yellow-host01:/tmp/rdma.pcap .
+scp <lab-host>:~/rdma.pcap ~/Desktop/
+```
+
+2. Open `rdma.pcap` directly in the Wireshark GUI — it recognizes UDP port 4791 and
+   decodes the BTH header as an "InfiniBand" layer (opcode, destination QP, PSN)
+   nested under the outer/inner IPv6 + UDP layers (this is an SRv6-encapsulated
+   packet, so expect two IPv6 layers before the UDP/InfiniBand ones).
+
+3. Or use `tshark` (installed alongside Wireshark) for a text or JSON dump of one
+   packet without opening the GUI. The SRv6 encapsulation can confuse `udp.port==4791`
+   as a display filter, so select by frame number instead — the number shown in
+   Wireshark's leftmost "No." column when browsing the same pcap:
+```bash
+# full expanded protocol tree, plain text
+tshark -r rdma.pcap -Y "frame.number==93" -V > packet.txt
+
+# same thing, as JSON
+tshark -r rdma.pcap -Y "frame.number==93" -T json > packet.json
+```
+   Look for the `infiniband.bth` fields: `opcode` (100 = `UD_SEND_ONLY`), `destqp`
+   (the per-EV `dqpn` — see `topo.dqpn_for_ev`), and `psn` (the sender's sequence
+   number). Note: Wireshark also shows a `deth` layer right after BTH, since the real
+   RoCEv2 spec always follows a UD-transport BTH with a DETH header — this emulator
+   doesn't build a real one, so those bytes are actually just the leading bytes of the
+   MRC accounting payload being reinterpreted as DETH fields. Harmless, but don't read
+   them as real DETH content.
 
 ### srctl `fault` and MRC traffic re-balance on failure
 

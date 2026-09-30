@@ -33,6 +33,16 @@ present), so this is cosmetic — flagged here rather than engineered
 away, since fixing it would mean threading addresses/ports through
 this module for zero functional benefit.
 
+Known simplification (confirmed via Wireshark, 2026-09-30): we don't
+build a DETH (Datagram Extended Transport Header), which the real
+RoCEv2 spec always requires immediately after a UD-transport BTH.
+Wireshark's dissector doesn't know that and parses the next 8 bytes —
+which are actually the leading bytes of the wrapped MRC payload struct
+(`seq`) — as if they were a real DETH (q_key/srcqp). Cosmetic only;
+nothing here or on the (nonexistent) receive side ever reads those
+bytes as DETH fields. See docs/quickstart.md's "Inspecting RoCEv2
+traffic" section for how to capture and decode this traffic.
+
 Scapy is lazy-imported inside each function (see `encap.py`'s
 docstring for why): this module must import cleanly on the
 orchestrator side, which has no scapy installed.
