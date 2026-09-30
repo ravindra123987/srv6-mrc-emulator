@@ -39,7 +39,7 @@ flows:
     #policy: ev_spray
     policy: health_aware_mrc
     rate: 10pps
-    duration: 30s
+    duration: 10s
 
 faults: []
 
