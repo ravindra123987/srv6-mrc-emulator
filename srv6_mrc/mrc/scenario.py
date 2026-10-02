@@ -22,6 +22,8 @@ Validates the full scenario shape laid out in mrc/README.md:
       loss_threshold: <float 0..1>
       loss_demote_consecutive: <int>
       min_active_evs: <int>
+      loss_backoff_max_level: <int >= 0>   # 0 disables the backoff
+      loss_backoff_reset_ticks: <int>
     faults:                          # optional
       - kind: netem
         target: <target-string>
@@ -129,6 +131,8 @@ class MrcSpec:
     loss_threshold: float | None = None
     loss_demote_consecutive: int | None = None
     min_active_evs: int | None = None
+    loss_backoff_max_level: int | None = None
+    loss_backoff_reset_ticks: int | None = None
 
     def to_env_json(self) -> str:
         """Encode for the SRV6_MRC_CONFIG_JSON env var consumed by
@@ -507,9 +511,9 @@ _MRC_POSITIVE_INT_FIELDS = (
     "probe_interval_ms", "probe_timeout_ms", "loss_window_ms",
     "max_window_skew_ms", "probe_window_ticks", "probe_min_samples",
     "probe_recover_ticks", "loss_demote_consecutive",
-    "min_active_evs",
+    "min_active_evs", "loss_backoff_reset_ticks",
 )
-_MRC_NON_NEGATIVE_INT_FIELDS: tuple = ()
+_MRC_NON_NEGATIVE_INT_FIELDS = ("loss_backoff_max_level",)
 _MRC_RATIO_FIELDS = (
     "probe_fail_ratio", "probe_recover_ratio", "loss_threshold",
 )
