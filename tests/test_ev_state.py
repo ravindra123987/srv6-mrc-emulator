@@ -687,5 +687,83 @@ class TestThreadSafety(unittest.TestCase):
         self.assertIs(t.state("green", 0, 0), EVState.ASSUMED_BAD)
 
 
+class TestLossDemoteBackoff(unittest.TestCase):
+    """Probes can't vouch for an EV the loss path demoted (e.g. green's
+    last hop, which probes never cross), so each loss demote that
+    follows a recent loss-driven recovery doubles the next recovery
+    hold, up to loss_backoff_max_level."""
+
+    CFG = EVStateConfig(
+        probe_window_ticks=2, probe_min_samples=3,
+        probe_fail_ratio=0.5, probe_recover_ratio=0.9,
+        probe_recover_ticks=2,
+        loss_threshold=0.05, loss_demote_consecutive=1,
+        min_active_evs=1,
+        loss_backoff_max_level=2, loss_backoff_reset_ticks=20,
+    )
+    EVS = [(0, 0), (1, 0), (2, 0), (3, 0)]
+
+    def _fresh(self):
+        t = _table(cfg=self.CFG)
+        _drive_healthy(t, "green", self.EVS)
+        self.assertIs(t.state("green", 3, 0), EVState.GOOD)
+        return t
+
+    @staticmethod
+    def _loss_demote(t):
+        t.record_loss_window("green", 3, 0, seen=0, expected=10)
+        assert t.state("green", 3, 0) is EVState.ASSUMED_BAD
+
+    def _ticks_to_good(self, t, limit=100):
+        for n in range(1, limit + 1):
+            _drive_healthy(t, "green", self.EVS, ticks=1)
+            if t.state("green", 3, 0) is EVState.GOOD:
+                return n
+        self.fail("EV never recovered")
+
+    def test_repeated_loss_demotes_double_the_hold(self):
+        t = self._fresh()
+        holds = []
+        for _ in range(4):
+            self._loss_demote(t)
+            holds.append(self._ticks_to_good(t))
+        # base 2 ticks, then x2 per repeat, capped at level 2 (x4)
+        self.assertEqual(holds, [2, 4, 8, 8])
+        self.assertEqual(
+            t.inspect("green", 3, 0)["loss_backoff_level"], 2)
+
+    def test_quiet_period_resets_backoff(self):
+        t = self._fresh()
+        self._loss_demote(t)
+        self._ticks_to_good(t)
+        self._loss_demote(t)
+        self.assertEqual(self._ticks_to_good(t), 4)
+        _drive_healthy(t, "green", self.EVS, ticks=20)  # reset window
+        self._loss_demote(t)
+        self.assertEqual(self._ticks_to_good(t), 2)
+
+    def test_first_loss_demote_after_cold_start_uses_base_hold(self):
+        # The UNKNOWN -> GOOD promotion is not a loss recovery.
+        t = self._fresh()
+        self._loss_demote(t)
+        self.assertEqual(self._ticks_to_good(t), 2)
+
+    def test_probe_demote_recovers_at_base_despite_backoff(self):
+        # Probes saw this failure, so their recovery is trustworthy.
+        t = self._fresh()
+        for _ in range(3):
+            self._loss_demote(t)
+            self._ticks_to_good(t)
+        _drive_failing(t, "green", 3, 0)
+        self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
+        # window flush (window_ticks - 1) + recover_ticks
+        self.assertEqual(self._ticks_to_good(t), 3)
+
+    def test_defaults(self):
+        cfg = EVStateConfig()
+        self.assertEqual(cfg.loss_backoff_max_level, 3)
+        self.assertEqual(cfg.loss_backoff_reset_ticks, 60)
+
+
 if __name__ == "__main__":
     unittest.main()
